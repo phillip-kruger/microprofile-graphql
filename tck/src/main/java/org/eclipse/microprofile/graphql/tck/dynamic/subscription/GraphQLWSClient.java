@@ -20,25 +20,23 @@ package org.eclipse.microprofile.graphql.tck.dynamic.subscription;
 import java.io.IOException;
 import java.io.StringReader;
 import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.WebSocket;
 import java.util.Map;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
-import io.vertx.core.Vertx;
-import io.vertx.core.http.HttpClient;
-import io.vertx.core.http.HttpClientOptions;
-import io.vertx.core.http.WebSocket;
-import io.vertx.core.http.WebSocketConnectOptions;
 import jakarta.json.Json;
 import jakarta.json.JsonObject;
 import jakarta.json.JsonObjectBuilder;
 import jakarta.json.JsonReader;
 
 /**
- * A simple WebSocket client that implements the graphql-transport-ws protocol using Vert.x.
+ * A simple WebSocket client that implements the graphql-transport-ws protocol using java.net.http.
  *
  * This client is used for testing GraphQL subscriptions over WebSocket. It implements the graphql-transport-ws protocol
  * as specified in: https://github.com/enisdenjo/graphql-ws/blob/master/PROTOCOL.md
@@ -59,8 +57,7 @@ public class GraphQLWSClient implements AutoCloseable {
     private static final String MESSAGE_COMPLETE = "complete";
 
     private final URI uri;
-    private final Vertx vertx;
-    private final HttpClient client;
+    private final HttpClient httpClient;
     private WebSocket webSocket;
     private final AtomicInteger operationIdCounter = new AtomicInteger(0);
     private final Map<String, SubscriptionHandler> subscriptions = new ConcurrentHashMap<>();
@@ -68,47 +65,67 @@ public class GraphQLWSClient implements AutoCloseable {
 
     public GraphQLWSClient(URI uri) {
         this.uri = uri;
-        this.vertx = Vertx.vertx();
-        HttpClientOptions options = new HttpClientOptions()
-                .setDefaultHost(uri.getHost())
-                .setDefaultPort(uri.getPort() > 0 ? uri.getPort() : 80);
-        this.client = vertx.createHttpClient(options);
+        this.httpClient = HttpClient.newHttpClient();
     }
 
     public void connect() throws Exception {
         CountDownLatch connectLatch = new CountDownLatch(1);
-        CountDownLatch[] errorLatch = {null};
+        Exception[] connectError = {null};
 
-        WebSocketConnectOptions options = new WebSocketConnectOptions()
-                .setHost(uri.getHost())
-                .setPort(uri.getPort() > 0 ? uri.getPort() : 80)
-                .setURI(uri.getPath())
-                .addSubProtocol("graphql-transport-ws");
+        httpClient.newWebSocketBuilder()
+                .subprotocols("graphql-transport-ws")
+                .buildAsync(uri, new WebSocket.Listener() {
+                    private final StringBuilder messageBuffer = new StringBuilder();
 
-        client.webSocket(options, ar -> {
-            if (ar.succeeded()) {
-                webSocket = ar.result();
-                setupWebSocketHandlers();
-                connectLatch.countDown();
+                    @Override
+                    public void onOpen(WebSocket ws) {
+                        webSocket = ws;
+                        connectLatch.countDown();
+                        ws.request(1);
 
-                // Send connection_init
-                JsonObject initMessage = Json.createObjectBuilder()
-                        .add("type", MESSAGE_CONNECTION_INIT)
-                        .build();
-                sendMessage(initMessage);
-            } else {
-                LOG.severe("Failed to connect WebSocket: " + ar.cause().getMessage());
-                errorLatch[0] = new CountDownLatch(0);
-                connectLatch.countDown();
-            }
-        });
+                        JsonObject initMessage = Json.createObjectBuilder()
+                                .add("type", MESSAGE_CONNECTION_INIT)
+                                .build();
+                        sendMessage(initMessage);
+                    }
+
+                    @Override
+                    public CompletionStage<?> onText(WebSocket ws, CharSequence data, boolean last) {
+                        messageBuffer.append(data);
+                        if (last) {
+                            String message = messageBuffer.toString();
+                            messageBuffer.setLength(0);
+                            handleMessage(message);
+                        }
+                        ws.request(1);
+                        return null;
+                    }
+
+                    @Override
+                    public CompletionStage<?> onClose(WebSocket ws, int statusCode, String reason) {
+                        LOG.info("WebSocket connection closed");
+                        return null;
+                    }
+
+                    @Override
+                    public void onError(WebSocket ws, Throwable error) {
+                        LOG.severe("WebSocket error: " + error.getMessage());
+                        error.printStackTrace();
+                    }
+                }).exceptionally(ex -> {
+                    connectError[0] = new RuntimeException("Failed to connect WebSocket: " + ex.getMessage(), ex);
+                    connectLatch.countDown();
+                    return null;
+                });
 
         boolean connected = connectLatch.await(10, TimeUnit.SECONDS);
-        if (!connected || errorLatch[0] != null) {
+        if (!connected) {
             throw new RuntimeException("Failed to connect WebSocket within timeout");
         }
+        if (connectError[0] != null) {
+            throw connectError[0];
+        }
 
-        // Wait for connection_ack
         boolean acked = connectionAckLatch.await(10, TimeUnit.SECONDS);
         if (!acked) {
             throw new RuntimeException("Did not receive connection_ack within timeout");
@@ -116,56 +133,44 @@ public class GraphQLWSClient implements AutoCloseable {
         LOG.info("WebSocket connection established and acknowledged");
     }
 
-    private void setupWebSocketHandlers() {
-        webSocket.textMessageHandler(message -> {
-            LOG.fine("Received message: " + message);
-            try (JsonReader reader = Json.createReader(new StringReader(message))) {
-                JsonObject json = reader.readObject();
-                String type = json.getString("type");
+    private void handleMessage(String message) {
+        LOG.fine("Received message: " + message);
+        try (JsonReader reader = Json.createReader(new StringReader(message))) {
+            JsonObject json = reader.readObject();
+            String type = json.getString("type");
 
-                switch (type) {
-                    case MESSAGE_CONNECTION_ACK :
-                        connectionAckLatch.countDown();
-                        LOG.info("Connection acknowledged");
-                        break;
+            switch (type) {
+                case MESSAGE_CONNECTION_ACK :
+                    connectionAckLatch.countDown();
+                    LOG.info("Connection acknowledged");
+                    break;
 
-                    case MESSAGE_PING :
-                        // Respond with pong
-                        JsonObject pong = Json.createObjectBuilder()
-                                .add("type", MESSAGE_PONG)
-                                .build();
-                        sendMessage(pong);
-                        break;
+                case MESSAGE_PING :
+                    JsonObject pong = Json.createObjectBuilder()
+                            .add("type", MESSAGE_PONG)
+                            .build();
+                    sendMessage(pong);
+                    break;
 
-                    case MESSAGE_NEXT :
-                        handleNext(json);
-                        break;
+                case MESSAGE_NEXT :
+                    handleNext(json);
+                    break;
 
-                    case MESSAGE_ERROR :
-                        handleError(json);
-                        break;
+                case MESSAGE_ERROR :
+                    handleError(json);
+                    break;
 
-                    case MESSAGE_COMPLETE :
-                        handleComplete(json);
-                        break;
+                case MESSAGE_COMPLETE :
+                    handleComplete(json);
+                    break;
 
-                    default :
-                        LOG.warning("Unknown message type: " + type);
-                }
-            } catch (Exception e) {
-                LOG.severe("Error processing message: " + e.getMessage());
-                e.printStackTrace();
+                default :
+                    LOG.warning("Unknown message type: " + type);
             }
-        });
-
-        webSocket.exceptionHandler(throwable -> {
-            LOG.severe("WebSocket error: " + throwable.getMessage());
-            throwable.printStackTrace();
-        });
-
-        webSocket.closeHandler(v -> {
-            LOG.info("WebSocket connection closed");
-        });
+        } catch (Exception e) {
+            LOG.severe("Error processing message: " + e.getMessage());
+            e.printStackTrace();
+        }
     }
 
     public String subscribe(String query, JsonObject variables, SubscriptionHandler handler) {
@@ -203,14 +208,8 @@ public class GraphQLWSClient implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
-        if (webSocket != null && !webSocket.isClosed()) {
-            webSocket.close();
-        }
-        if (client != null) {
-            client.close();
-        }
-        if (vertx != null) {
-            vertx.close();
+        if (webSocket != null && !webSocket.isInputClosed() && !webSocket.isOutputClosed()) {
+            webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "");
         }
     }
 
@@ -228,8 +227,6 @@ public class GraphQLWSClient implements AutoCloseable {
         String id = message.getString("id");
         SubscriptionHandler handler = subscriptions.get(id);
         if (handler != null) {
-            // The payload for errors in graphql-transport-ws is an array of error objects
-            // For simplicity, we'll pass the whole message to the handler
             handler.onError(message);
             subscriptions.remove(id);
         }
@@ -245,8 +242,8 @@ public class GraphQLWSClient implements AutoCloseable {
     }
 
     private void sendMessage(JsonObject message) {
-        if (webSocket != null && !webSocket.isClosed()) {
-            webSocket.writeTextMessage(message.toString());
+        if (webSocket != null && !webSocket.isOutputClosed()) {
+            webSocket.sendText(message.toString(), true);
         } else {
             LOG.severe("WebSocket is not open, cannot send message");
         }
